@@ -1,114 +1,140 @@
 use tokio::net::{TcpListener, TcpStream};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::fs::OpenOptions;
-use tokio::sync::Mutex;
-use chrono::Local;
-use std::path::Path;
-use std::sync::Arc;
+use tokio::sync::broadcast;
+use tokio_tungstenite::accept_async;
+use tokio_tungstenite::connect_async;
+use tungstenite::Message;
+use futures::{SinkExt, StreamExt};
+use std::env;
+use url::Url;
 
-async fn handle_client(mut socket: TcpStream, log_file_path_mutex: Arc<Mutex<String>>) {
-    let peer_addr = match socket.peer_addr() {
-        Ok(addr) => addr.to_string(),
-        Err(_) => "unknown".to_string(),
-    };
-    
-    println!("Client connected: {}", peer_addr);
-    
-    let mut buffer = [0u8; 1024];
-    
+async fn websocket_server(addr: &str) {
+    let listener = TcpListener::bind(addr)
+        .await
+        .expect("Failed to bind WebSocket server");
+
+    println!("WebSocket server running on {}", addr);
+
+    let (tx, _rx) = broadcast::channel::<String>(100);
+
     loop {
-        match socket.read(&mut buffer).await {
-            Ok(0) => {
-                println!("Client disconnected: {}", peer_addr);
-                break;
-            },
-            Ok(n) => {
-                if let Ok(message) = String::from_utf8(buffer[0..n].to_vec()) {
-                    let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string();
-                    let log_entry = format!("[{}] [{}]: {}\n", timestamp, peer_addr, message.trim());
-                    print!("{}", log_entry);
-                    if let Err(e) = write_to_log(&log_file_path_mutex, &log_entry).await {
-                        eprintln!("Error writing to log file: {}", e);
-                    }
-                    
-                    let response = format!("Message logged at {}\n", timestamp);
-                    if let Err(e) = socket.write_all(response.as_bytes()).await {
-                        eprintln!("Error writing to client: {}", e);
+        let (stream, peer_addr) = match listener.accept().await {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("Accept error: {}", e);
+                continue;
+            }
+        };
+        let tx = tx.clone();
+        let mut rx = tx.subscribe();
+
+        println!("New client: {}", peer_addr);
+
+        tokio::spawn(async move {
+            let ws_stream = match accept_async(stream).await {
+                Ok(ws) => ws,
+                Err(e) => {
+                    eprintln!("WebSocket handshake error: {}", e);
+                    return;
+                }
+            };
+            let (mut ws_sender, mut ws_receiver) = ws_stream.split();
+
+            let send_task = tokio::spawn(async move {
+                while let Ok(msg) = rx.recv().await {
+                    if ws_sender
+                        .send(Message::Text(msg))
+                        .await
+                        .is_err()
+                    {
                         break;
                     }
                 }
-            },
-            Err(e) => {
-                eprintln!("Error reading from socket: {}", e);
-                break;
+            });
+
+            while let Some(Ok(msg)) = ws_receiver.next().await {
+                match msg {
+                    Message::Text(text) => {
+                        println!("Received: {}", text);
+                        let _ = tx.send(text);
+                    }
+                    Message::Binary(bin) => {
+                        println!("Received binary ({} bytes)", bin.len());
+                        let _ = tx.send(format!("[binary msg: {} bytes]", bin.len()));
+                    }
+                    Message::Close(_) => {
+                        println!("Client disconnected");
+                        break;
+                    }
+                    _ => {}
+                }
             }
-        }
+
+            send_task.abort();
+        });
     }
 }
 
-async fn write_to_log(log_file_path_mutex: &Arc<Mutex<String>>, log_entry: &str) -> Result<(), Box<dyn std::error::Error>> {
-    // On verrouille le mutex avant d'ouvrir/écrire dans le fichier
-    let log_file_path = {
-        let guard = log_file_path_mutex.lock().await;
-        guard.clone()
-    };
+async fn websocket_client(url: &str) {
+    let url = Url::parse(url).unwrap();
+    let (ws_stream, _) = connect_async(url).await.expect("Failed to connect");
+    println!("WebSocket client connected!");
 
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .append(true)
-        .open(&log_file_path)
-        .await?;
-    
-    file.write_all(log_entry.as_bytes()).await?;
-    
-    Ok(())
+    let (mut ws_sender, mut ws_receiver) = ws_stream.split();
+
+    let send_task = tokio::spawn(async move {
+        use tokio::io::{self, AsyncBufReadExt, BufReader};
+
+        let stdin = io::stdin();
+        let mut lines = BufReader::new(stdin).lines();
+
+        println!("Type messages, enter 'quit' to exit.");
+        while let Ok(Some(line)) = lines.next_line().await {
+            if line.trim() == "quit" {
+                let _ = ws_sender.send(Message::Close(None)).await;
+                break;
+            } else {
+                let _ = ws_sender.send(Message::Text(line)).await;
+            }
+        }
+    });
+
+    while let Some(msg) = ws_receiver.next().await {
+        match msg {
+            Ok(Message::Text(text)) => println!("Server: {}", text),
+            Ok(Message::Binary(bin)) => println!("Server sent binary ({} bytes)", bin.len()),
+            Ok(Message::Close(_)) => {
+                println!("Connection closed by server.");
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    let _ = send_task.await;
 }
 
 #[tokio::main]
 async fn main() {
-    let addr = "127.0.0.1:8080";
-    let log_file_path = Arc::new(Mutex::new("server_logs.txt".to_string()));
-    
-    // On récupère la valeur dans le mutex pour vérifier le chemin
-    {
-        let guard = log_file_path.lock().await;
-        if let Some(parent) = Path::new(&*guard).parent() {
-            if !parent.exists() {
-                if let Err(e) = std::fs::create_dir_all(parent) {
-                    eprintln!("Failed to create log directory: {}", e);
-                    return;
-                }
-            }
-        }
+    let args: Vec<String> = env::args().collect();
+
+    if args.len() < 2 {
+        println!("Usage:");
+        println!("  {} server [address:port]", args[0]);
+        println!("  {} client [ws://address:port]", args[0]);
+        return;
     }
-    
-    let listener = match TcpListener::bind(addr).await {
-        Ok(listener) => listener,
-        Err(e) => {
-            eprintln!("Failed to bind to address {}: {}", addr, e);
-            return;
+
+    match args[1].as_str() {
+        "server" => {
+            let addr = args.get(2).cloned().unwrap_or_else(|| "127.0.0.1:8080".to_string());
+            websocket_server(&addr).await;
         }
-    };
-    
-    {
-        let guard = log_file_path.lock().await;
-        println!("Async logging server started on {}", addr);
-        println!("Logs will be written to {}", *guard);
-    }
-    
-    loop {
-        match listener.accept().await {
-            Ok((socket, _)) => {
-                let log_file_path_clone = Arc::clone(&log_file_path);
-                
-                tokio::spawn(async move {
-                    handle_client(socket, log_file_path_clone).await;
-                });
-            }
-            Err(e) => {
-                eprintln!("Error accepting connection: {}", e);
-            }
+        "client" => {
+            let url = args.get(2).cloned().unwrap_or_else(|| "ws://127.0.0.1:8080".to_string());
+            websocket_client(&url).await;
+        }
+        _ => {
+            println!("Unknown subcommand. Use 'server' or 'client'.");
         }
     }
 }
