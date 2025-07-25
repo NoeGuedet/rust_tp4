@@ -1,12 +1,12 @@
 use tokio::net::{TcpListener, TcpStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::fs::OpenOptions;
-use tokio::io::AsyncWriteExt as IoAsyncWriteExt;
-use std::sync::Arc;
+use tokio::sync::Mutex;
 use chrono::Local;
 use std::path::Path;
+use std::sync::Arc;
 
-async fn handle_client(mut socket: TcpStream, log_file_path: Arc<String>) {
+async fn handle_client(mut socket: TcpStream, log_file_path_mutex: Arc<Mutex<String>>) {
     let peer_addr = match socket.peer_addr() {
         Ok(addr) => addr.to_string(),
         Err(_) => "unknown".to_string(),
@@ -27,7 +27,7 @@ async fn handle_client(mut socket: TcpStream, log_file_path: Arc<String>) {
                     let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string();
                     let log_entry = format!("[{}] [{}]: {}\n", timestamp, peer_addr, message.trim());
                     print!("{}", log_entry);
-                    if let Err(e) = write_to_log(&log_file_path, &log_entry).await {
+                    if let Err(e) = write_to_log(&log_file_path_mutex, &log_entry).await {
                         eprintln!("Error writing to log file: {}", e);
                     }
                     
@@ -46,12 +46,18 @@ async fn handle_client(mut socket: TcpStream, log_file_path: Arc<String>) {
     }
 }
 
-async fn write_to_log(log_file_path: &str, log_entry: &str) -> Result<(), Box<dyn std::error::Error>> {
+async fn write_to_log(log_file_path_mutex: &Arc<Mutex<String>>, log_entry: &str) -> Result<(), Box<dyn std::error::Error>> {
+    // On verrouille le mutex avant d'ouvrir/écrire dans le fichier
+    let log_file_path = {
+        let guard = log_file_path_mutex.lock().await;
+        guard.clone()
+    };
+
     let mut file = OpenOptions::new()
         .write(true)
         .create(true)
         .append(true)
-        .open(log_file_path)
+        .open(&log_file_path)
         .await?;
     
     file.write_all(log_entry.as_bytes()).await?;
@@ -62,13 +68,17 @@ async fn write_to_log(log_file_path: &str, log_entry: &str) -> Result<(), Box<dy
 #[tokio::main]
 async fn main() {
     let addr = "127.0.0.1:8080";
-    let log_file_path = Arc::new("server_logs.txt".to_string());
+    let log_file_path = Arc::new(Mutex::new("server_logs.txt".to_string()));
     
-    if let Some(parent) = Path::new(&*log_file_path).parent() {
-        if !parent.exists() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                eprintln!("Failed to create log directory: {}", e);
-                return;
+    // On récupère la valeur dans le mutex pour vérifier le chemin
+    {
+        let guard = log_file_path.lock().await;
+        if let Some(parent) = Path::new(&*guard).parent() {
+            if !parent.exists() {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    eprintln!("Failed to create log directory: {}", e);
+                    return;
+                }
             }
         }
     }
@@ -81,8 +91,11 @@ async fn main() {
         }
     };
     
-    println!("Async logging server started on {}", addr);
-    println!("Logs will be written to {}", log_file_path);
+    {
+        let guard = log_file_path.lock().await;
+        println!("Async logging server started on {}", addr);
+        println!("Logs will be written to {}", *guard);
+    }
     
     loop {
         match listener.accept().await {
